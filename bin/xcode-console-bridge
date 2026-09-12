@@ -1,0 +1,527 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# xcode-console-bridge captures the text currently visible in Xcode's Debug
+# Console. It intentionally uses Accessibility focus verification before it
+# copies anything: a non-empty clipboard is not evidence that Console was read.
+
+APP_NAME=""
+RUN_LABEL="unassigned"
+OUT_ROOT="xcode-console-evidence"
+WINDOW_TOKEN=""
+IDENTITY_TOKENS=()
+TAIL_LINES="300"
+CONTEXT_LINES="4"
+KEYWORD_LIMIT="800"
+MIN_CAPTURE_BYTES="256"
+COPY_WAIT_ATTEMPTS="20"
+COPY_WAIT_INTERVAL_SECONDS="0.25"
+FOCUS_TIMEOUT_SECONDS="12"
+FOCUS_POLL_INTERVAL_SECONDS="0.1"
+IMPORT_CLIPBOARD="0"
+RAW_LOG_INPUT=""
+LIST_WINDOWS="0"
+SET_BASELINE="0"
+NOTIFY="1"
+RESTORE_FRONT_APP="1"
+CAPTURE_MODE="xcode-ui"
+CAPTURE_COPY_METHOD="xcode-ui"
+CAPTURE_PAYLOAD_VALIDATION="not-applicable"
+ORIGINAL_FRONT_BUNDLE=""
+ACTIVE_OSASCRIPT_PID=""
+FOCUS_AND_COPY_LAST_OUTPUT=""
+
+usage() {
+  cat <<'USAGE'
+Usage:
+  xcode-console-bridge --window-token TOKEN [options]
+  xcode-console-bridge --list-windows
+
+Capture options:
+  --window-token TOKEN    Required substring that identifies one Xcode window.
+  --app-name NAME         Human-readable app name recorded in the evidence.
+  --run LABEL             Run or reproduction label. Default: unassigned.
+  --identity-token TOKEN  Expected app/log token. Repeatable; strengthens
+                          clipboard validation.
+  --out-root DIR          Evidence root. Default: xcode-console-evidence.
+  --tail-lines N          Lines included from the end of the log in digest.
+  --context-lines N       Context lines around diagnostic hits in digest.
+  --keyword-limit N       Maximum diagnostic snippet lines in digest.
+  --set-baseline          Store this capture's metrics as the known-good baseline.
+  --import-clipboard      Import text the user already copied from Console.
+  --raw-log FILE          Normalize an existing raw log into an evidence bundle.
+  --no-notify             Do not show a macOS notification after success.
+  --no-restore-front-app  Leave Xcode frontmost after capture.
+  --list-windows          Print Xcode window titles and exit.
+  -h, --help              Show this help.
+
+Examples:
+  xcode-console-bridge --window-token MyApp --app-name MyApp \
+    --identity-token MyApp --run delete-regression
+
+  xcode-console-bridge --window-token MyApp --import-clipboard --run manual-copy
+USAGE
+}
+
+die() {
+  printf 'error: %s\n' "$*" >&2
+  exit 1
+}
+
+require_tool() {
+  command -v "$1" >/dev/null 2>&1 || die "missing required tool: $1"
+}
+
+lower() {
+  printf '%s' "$1" | tr '[:upper:]' '[:lower:]'
+}
+
+safe_path_component() {
+  local value="$1"
+  value="$(printf '%s' "$value" | tr -cs '[:alnum:]._- ' '_')"
+  value="${value##_}"
+  value="${value%%_}"
+  [[ -n "$value" && "$value" != "." && "$value" != ".." ]] || value="unassigned"
+  printf '%s' "$value"
+}
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --window-token)
+      WINDOW_TOKEN="${2:-}"
+      shift 2
+      ;;
+    --app-name)
+      APP_NAME="${2:-}"
+      shift 2
+      ;;
+    --run)
+      RUN_LABEL="${2:-}"
+      shift 2
+      ;;
+    --identity-token)
+      [[ $# -ge 2 && -n "${2:-}" ]] || die "--identity-token requires a value"
+      IDENTITY_TOKENS+=("$2")
+      shift 2
+      ;;
+    --out-root)
+      OUT_ROOT="${2:-}"
+      shift 2
+      ;;
+    --tail-lines)
+      TAIL_LINES="${2:-}"
+      shift 2
+      ;;
+    --context-lines)
+      CONTEXT_LINES="${2:-}"
+      shift 2
+      ;;
+    --keyword-limit)
+      KEYWORD_LIMIT="${2:-}"
+      shift 2
+      ;;
+    --set-baseline)
+      SET_BASELINE="1"
+      shift
+      ;;
+    --import-clipboard)
+      IMPORT_CLIPBOARD="1"
+      CAPTURE_MODE="clipboard-import"
+      shift
+      ;;
+    --raw-log)
+      [[ $# -ge 2 ]] || die "--raw-log requires a file path"
+      RAW_LOG_INPUT="$2"
+      CAPTURE_MODE="raw-log-import"
+      shift 2
+      ;;
+    --list-windows)
+      LIST_WINDOWS="1"
+      shift
+      ;;
+    --no-notify)
+      NOTIFY="0"
+      shift
+      ;;
+    --no-restore-front-app)
+      RESTORE_FRONT_APP="0"
+      shift
+      ;;
+    -h|--help)
+      usage
+      exit 0
+      ;;
+    *)
+      die "unknown argument: $1"
+      ;;
+  esac
+done
+
+require_tool rg
+
+if [[ "$IMPORT_CLIPBOARD" == "1" && -n "$RAW_LOG_INPUT" ]]; then
+  die "--import-clipboard and --raw-log cannot be used together"
+fi
+
+if [[ "$CAPTURE_MODE" == "raw-log-import" && ! -f "$RAW_LOG_INPUT" ]]; then
+  die "raw log file not found: $RAW_LOG_INPUT"
+fi
+
+if [[ "$LIST_WINDOWS" == "1" || "$CAPTURE_MODE" == "xcode-ui" ]]; then
+  require_tool osascript
+fi
+
+if [[ "$CAPTURE_MODE" == "xcode-ui" || "$IMPORT_CLIPBOARD" == "1" ]]; then
+  require_tool pbpaste
+fi
+
+if [[ "$CAPTURE_MODE" == "xcode-ui" ]]; then
+  require_tool pbcopy
+fi
+
+ensure_xcode_running() {
+  pgrep -x Xcode >/dev/null 2>&1 || die "Xcode is not running"
+}
+
+list_windows() {
+  ensure_xcode_running
+  osascript <<'APPLESCRIPT'
+tell application "Xcode"
+  set output to ""
+  repeat with w in windows
+    set output to output & (name of w as text) & linefeed
+  end repeat
+  return output
+end tell
+APPLESCRIPT
+}
+
+frontmost_bundle_id() {
+  osascript <<'APPLESCRIPT' 2>/dev/null || true
+tell application "System Events"
+  set frontApps to application processes whose frontmost is true
+  if (count of frontApps) is 0 then return ""
+  return bundle identifier of item 1 of frontApps
+end tell
+APPLESCRIPT
+}
+
+restore_front_app() {
+  [[ "$RESTORE_FRONT_APP" == "1" ]] || return 0
+  [[ -n "$ORIGINAL_FRONT_BUNDLE" ]] || return 0
+  [[ "$ORIGINAL_FRONT_BUNDLE" == "com.apple.dt.Xcode" ]] && return 0
+  osascript - "$ORIGINAL_FRONT_BUNDLE" <<'APPLESCRIPT' >/dev/null 2>&1 || true
+on run argv
+  tell application id (item 1 of argv) to activate
+end run
+APPLESCRIPT
+}
+
+payload_looks_like_console() {
+  local payload="$1"
+  local sample="${payload:0:65536}"
+  local token=""
+
+  PAYLOAD_VALIDATION_LAST_REASON="unknown"
+  if rg -q -i -m 1 '<!doctype[[:space:]]+html|<html([[:space:]>])|<body([[:space:]>])|<script([[:space:]>])' <<<"$sample"; then
+    PAYLOAD_VALIDATION_LAST_REASON="html_document"
+    return 1
+  fi
+
+  for token in "${IDENTITY_TOKENS[@]}"; do
+    if rg -q -F -i -m 1 "$token" <<<"$payload"; then
+      PAYLOAD_VALIDATION_LAST_REASON="app_identity"
+      return 0
+    fi
+  done
+
+  if rg -q -i -m 1 '(^|[[:space:]])(error|warning|fatal|assert|exception):|(^|[[:space:]])[[:alnum:]_.-]+=[^[:space:]]+|^[0-9]{2}:[0-9]{2}:[0-9]{2}|^[0-9]{4}-[0-9]{2}-[0-9]{2}' <<<"$payload"; then
+    PAYLOAD_VALIDATION_LAST_REASON="console_shape"
+    return 0
+  fi
+
+  PAYLOAD_VALIDATION_LAST_REASON="not_console_shaped"
+  return 1
+}
+
+wait_for_usable_console_clipboard() {
+  local marker="$1"
+  local attempt=1
+  local candidate=""
+  local candidate_bytes=0
+
+  CAPTURED=""
+  CAPTURE_WAIT_LAST_BYTES=0
+  CAPTURE_WAIT_LAST_STATE="not_started"
+  while [[ "$attempt" -le "$COPY_WAIT_ATTEMPTS" ]]; do
+    candidate="$(pbpaste || true)"
+    candidate_bytes="$(printf '%s' "$candidate" | wc -c | xargs)"
+    CAPTURE_WAIT_LAST_BYTES="$candidate_bytes"
+    if [[ "$candidate" == "$marker" ]]; then
+      CAPTURE_WAIT_LAST_STATE="marker_unchanged"
+    elif [[ -z "$candidate" ]]; then
+      CAPTURE_WAIT_LAST_STATE="empty"
+    elif [[ "$candidate_bytes" -lt "$MIN_CAPTURE_BYTES" ]]; then
+      CAPTURE_WAIT_LAST_STATE="too_small"
+    elif ! payload_looks_like_console "$candidate"; then
+      CAPTURE_WAIT_LAST_STATE="rejected_${PAYLOAD_VALIDATION_LAST_REASON}"
+    else
+      CAPTURED="$candidate"
+      CAPTURE_WAIT_LAST_STATE="ready"
+      CAPTURE_PAYLOAD_VALIDATION="console-shape-v1:${PAYLOAD_VALIDATION_LAST_REASON}"
+      return 0
+    fi
+    if [[ "$attempt" -lt "$COPY_WAIT_ATTEMPTS" ]]; then
+      sleep "$COPY_WAIT_INTERVAL_SECONDS"
+    fi
+    attempt=$((attempt + 1))
+  done
+  return 1
+}
+
+focus_and_copy_console_applescript() {
+  osascript - "$TARGET_WINDOW" <<'APPLESCRIPT'
+on run argv
+  set targetWindow to item 1 of argv
+  with timeout of 10 seconds
+    tell application "Xcode" to activate
+    tell application "System Events"
+      tell process "Xcode"
+        set frontmost to true
+        repeat with w in windows
+          if (name of w as text) is targetWindow then
+            perform action "AXRaise" of w
+            try
+              set value of attribute "AXMain" of w to true
+            end try
+            exit repeat
+          end if
+        end repeat
+        delay 0.2
+        keystroke "c" using {command down, shift down}
+        delay 0.25
+        set focusedElement to value of attribute "AXFocusedUIElement"
+        set focusedDescription to ""
+        try
+          set focusedDescription to description of focusedElement as text
+        end try
+        if focusedDescription is not "Console" then
+          error "__CONSOLE_FOCUS_FAILED__:" & focusedDescription
+        end if
+        keystroke "a" using command down
+        delay 0.1
+        keystroke "c" using command down
+        delay 0.15
+        if frontmost is false then
+          error "__CONSOLE_FOCUS_LOST__:Xcode_not_frontmost"
+        end if
+        set copiedFocusedElement to value of attribute "AXFocusedUIElement"
+        set copiedFocusedDescription to ""
+        try
+          set copiedFocusedDescription to description of copiedFocusedElement as text
+        end try
+        if copiedFocusedDescription is not "Console" then
+          error "__CONSOLE_FOCUS_LOST__:" & copiedFocusedDescription
+        end if
+      end tell
+    end tell
+  end timeout
+end run
+APPLESCRIPT
+}
+
+focus_and_copy_console() {
+  local output_file=""
+  local started_at=0
+  local status=0
+  local timed_out=0
+
+  output_file="$(mktemp "${TMPDIR:-/tmp}/xcode-console-focus.XXXXXX")"
+  focus_and_copy_console_applescript >"$output_file" 2>&1 &
+  ACTIVE_OSASCRIPT_PID=$!
+  started_at="$(date +%s)"
+  while kill -0 "$ACTIVE_OSASCRIPT_PID" 2>/dev/null; do
+    if (( $(date +%s) - started_at >= FOCUS_TIMEOUT_SECONDS )); then
+      timed_out=1
+      kill "$ACTIVE_OSASCRIPT_PID" 2>/dev/null || true
+      sleep 0.2
+      kill -9 "$ACTIVE_OSASCRIPT_PID" 2>/dev/null || true
+      break
+    fi
+    sleep "$FOCUS_POLL_INTERVAL_SECONDS"
+  done
+  wait "$ACTIVE_OSASCRIPT_PID" 2>/dev/null || status=$?
+  ACTIVE_OSASCRIPT_PID=""
+  FOCUS_AND_COPY_LAST_OUTPUT="$(<"$output_file")"
+  rm -f "$output_file"
+  if [[ "$timed_out" == "1" ]]; then
+    FOCUS_AND_COPY_LAST_OUTPUT="${FOCUS_AND_COPY_LAST_OUTPUT}${FOCUS_AND_COPY_LAST_OUTPUT:+$'\n'}__CONSOLE_FOCUS_WATCHDOG_TIMEOUT__"
+    return 124
+  fi
+  return "$status"
+}
+
+notify_success() {
+  [[ "$NOTIFY" == "1" ]] || return 0
+  osascript - "$RUN_LABEL" "$RAW_LINES" <<'APPLESCRIPT' >/dev/null 2>&1 || true
+on run argv
+  display notification ("Saved " & item 2 of argv & " lines") with title "Xcode Console Captured" subtitle (item 1 of argv)
+end run
+APPLESCRIPT
+}
+
+if [[ "$LIST_WINDOWS" == "1" ]]; then
+  list_windows
+  exit 0
+fi
+
+if [[ "$CAPTURE_MODE" == "xcode-ui" ]]; then
+  [[ -n "$WINDOW_TOKEN" ]] || die "--window-token is required for an Xcode UI capture"
+  WINDOWS="$(list_windows)"
+  MATCHED_WINDOWS=()
+  token_lower="$(lower "$WINDOW_TOKEN")"
+  while IFS= read -r window_name; do
+    [[ -n "$window_name" ]] || continue
+    if [[ "$(lower "$window_name")" == *"$token_lower"* ]]; then
+      MATCHED_WINDOWS+=("$window_name")
+    fi
+  done <<<"$WINDOWS"
+  if [[ "${#MATCHED_WINDOWS[@]}" -eq 0 ]]; then
+    die "no Xcode window matched --window-token '$WINDOW_TOKEN'; run --list-windows to inspect titles"
+  fi
+  if [[ "${#MATCHED_WINDOWS[@]}" -gt 1 ]]; then
+    printf 'error: multiple Xcode windows matched --window-token %q:\n' "$WINDOW_TOKEN" >&2
+    printf '%s\n' "${MATCHED_WINDOWS[@]}" >&2
+    die "narrow the token until it identifies one window"
+  fi
+  TARGET_WINDOW="${MATCHED_WINDOWS[0]}"
+else
+  TARGET_WINDOW="not-applicable"
+fi
+
+RUN_LABEL="$(safe_path_component "$RUN_LABEL")"
+TS="$(date +%Y%m%d-%H%M%S)"
+SESSION_DIR="$OUT_ROOT/$RUN_LABEL/$TS"
+RAW_LOG="$SESSION_DIR/xcode-console.raw.log"
+DIGEST="$SESSION_DIR/xcode-console.digest.md"
+METRICS="$SESSION_DIR/xcode-console.metrics.tsv"
+COMPARE="$SESSION_DIR/xcode-console.compare.md"
+LATEST_LINK="$OUT_ROOT/latest"
+BASELINE_METRICS="$OUT_ROOT/baseline.metrics.tsv"
+
+mkdir -p "$SESSION_DIR"
+
+if [[ "$CAPTURE_MODE" == "raw-log-import" ]]; then
+  CAPTURE_COPY_METHOD="raw-log-import"
+  CAPTURE_PAYLOAD_VALIDATION="external-raw-log"
+  cp "$RAW_LOG_INPUT" "$RAW_LOG"
+elif [[ "$CAPTURE_MODE" == "clipboard-import" ]]; then
+  CAPTURE_COPY_METHOD="clipboard-import"
+  CAPTURED="$(pbpaste || true)"
+  payload_looks_like_console "$CAPTURED" || die "clipboard was rejected: $PAYLOAD_VALIDATION_LAST_REASON; copy Console text again or use --raw-log for a saved file"
+  CAPTURE_PAYLOAD_VALIDATION="clipboard-import:${PAYLOAD_VALIDATION_LAST_REASON}"
+  printf '%s\n' "$CAPTURED" > "$RAW_LOG"
+else
+  ORIGINAL_FRONT_BUNDLE="$(frontmost_bundle_id)"
+  OLD_CLIP="$(pbpaste || true)"
+  MARKER="__XCODE_CONSOLE_BRIDGE_${TS}__"
+  printf '%s' "$MARKER" | pbcopy
+  restore_clipboard() { printf '%s' "$OLD_CLIP" | pbcopy || true; }
+  cleanup() {
+    if [[ -n "$ACTIVE_OSASCRIPT_PID" ]]; then
+      kill "$ACTIVE_OSASCRIPT_PID" 2>/dev/null || true
+      kill -9 "$ACTIVE_OSASCRIPT_PID" 2>/dev/null || true
+      wait "$ACTIVE_OSASCRIPT_PID" 2>/dev/null || true
+    fi
+    restore_clipboard
+    restore_front_app
+  }
+  trap cleanup EXIT
+  if ! focus_and_copy_console; then
+    case "$FOCUS_AND_COPY_LAST_OUTPUT" in
+      *"not allowed assistive access"*|*"不允许辅助访问"*|*"-25211"*) die "macOS Accessibility permission is missing. Grant access to your terminal or agent host, then retry." ;;
+      *"__CONSOLE_FOCUS_FAILED__"*) die "Xcode has no active Debug Console for the matched window. Run the app from Xcode, show Console, then retry." ;;
+      *"__CONSOLE_FOCUS_LOST__"*) die "Xcode lost Debug Console focus while copying. No payload was accepted; retry with Xcode responsive." ;;
+      *"__CONSOLE_FOCUS_WATCHDOG_TIMEOUT__"*|*"AppleEvent timed out"*|*"-1712"*) die "Xcode console focus timed out after ${FOCUS_TIMEOUT_SECONDS}s." ;;
+      *) die "Xcode console capture failed: $FOCUS_AND_COPY_LAST_OUTPUT" ;;
+    esac
+  fi
+  CAPTURE_COPY_METHOD="focused-console-cmd-c"
+  if ! wait_for_usable_console_clipboard "$MARKER"; then
+    printf 'Console copy was not usable (%s; %s bytes); retrying once after focus verification.\n' "$CAPTURE_WAIT_LAST_STATE" "$CAPTURE_WAIT_LAST_BYTES" >&2
+    focus_and_copy_console || die "Xcode console copy retry failed: $FOCUS_AND_COPY_LAST_OUTPUT"
+    wait_for_usable_console_clipboard "$MARKER" || die "two verified-focus copies produced no usable console payload (%s; %s bytes). Manually copy Console and use --import-clipboard." "$CAPTURE_WAIT_LAST_STATE" "$CAPTURE_WAIT_LAST_BYTES"
+  fi
+  printf '%s\n' "$CAPTURED" > "$RAW_LOG"
+fi
+
+RAW_BYTES="$(wc -c < "$RAW_LOG" | xargs)"
+RAW_LINES="$(wc -l < "$RAW_LOG" | xargs)"
+[[ "$RAW_BYTES" -ge "$MIN_CAPTURE_BYTES" ]] || die "captured log is very small (${RAW_BYTES} bytes); Console may be empty or focus may be wrong"
+
+GENERIC_PATTERN='error|failed|failure|fatal|crash|assert|exception|timeout|warning|warn|main thread|hang|deadlock|sqlite|photokit|memory|thermal|terminated|SIG[A-Z]+'
+
+write_metrics() {
+  {
+    printf 'bytes\t%s\n' "$RAW_BYTES"
+    printf 'lines\t%s\n' "$RAW_LINES"
+    printf 'diagnostic_hits\t%s\n' "$(rg -i -c "$GENERIC_PATTERN" "$RAW_LOG" 2>/dev/null || printf '0')"
+    local token
+    for token in "${IDENTITY_TOKENS[@]}"; do
+      printf 'identity:%s\t%s\n' "$token" "$(rg -F -i -c "$token" "$RAW_LOG" 2>/dev/null || printf '0')"
+    done
+  } > "$METRICS"
+}
+
+metric_value() {
+  awk -F'\t' -v key="$2" '$1 == key { print $2; found=1; exit } END { if (!found) print 0 }' "$1"
+}
+
+write_digest() {
+  {
+    printf '# Xcode Console Evidence\n\n'
+    printf -- '- app: `%s`\n' "${APP_NAME:-unspecified}"
+    printf -- '- run: `%s`\n' "$RUN_LABEL"
+    printf -- '- captured_at: `%s`\n' "$TS"
+    printf -- '- capture_mode: `%s`\n' "$CAPTURE_MODE"
+    printf -- '- copy_method: `%s`\n' "$CAPTURE_COPY_METHOD"
+    printf -- '- payload_validation: `%s`\n' "$CAPTURE_PAYLOAD_VALIDATION"
+    printf -- '- xcode_window: `%s`\n' "$TARGET_WINDOW"
+    printf -- '- raw_log: `%s`\n' "$RAW_LOG"
+    printf -- '- bytes: `%s`\n- lines: `%s`\n\n' "$RAW_BYTES" "$RAW_LINES"
+    printf '## First 40 Lines\n\n```text\n'
+    sed -n '1,40p' "$RAW_LOG"
+    printf '\n```\n\n## Last %s Lines\n\n```text\n' "$TAIL_LINES"
+    tail -n "$TAIL_LINES" "$RAW_LOG"
+    printf '\n```\n\n## Diagnostic Hits\n\n```text\n'
+    rg -n -i -C "$CONTEXT_LINES" "$GENERIC_PATTERN" "$RAW_LOG" 2>/dev/null | head -n "$KEYWORD_LIMIT" || true
+    printf '\n```\n'
+  } > "$DIGEST"
+}
+
+write_compare() {
+  {
+    printf '# Xcode Console Baseline Compare\n\n'
+    printf -- '- current_metrics: `%s`\n' "$METRICS"
+    if [[ -f "$BASELINE_METRICS" ]]; then
+      printf -- '- compared_with: `%s`\n\n' "$BASELINE_METRICS"
+      printf '| metric | current | baseline | delta |\n| --- | ---: | ---: | ---: |\n'
+      while IFS=$'\t' read -r key current_value; do
+        baseline_value="$(metric_value "$BASELINE_METRICS" "$key")"
+        printf '| `%s` | %s | %s | %+d |\n' "$key" "$current_value" "$baseline_value" "$((current_value - baseline_value))"
+      done < "$METRICS"
+    else
+      printf '\nNo baseline is set. Capture a known-good run with `--set-baseline`.\n'
+    fi
+  } > "$COMPARE"
+}
+
+write_metrics
+write_digest
+write_compare
+if [[ "$SET_BASELINE" == "1" ]]; then
+  cp "$METRICS" "$BASELINE_METRICS"
+fi
+ln -sfn "$SESSION_DIR" "$LATEST_LINK"
+notify_success
+printf 'raw_log=%s\ndigest=%s\nmetrics=%s\ncompare=%s\n' "$RAW_LOG" "$DIGEST" "$METRICS" "$COMPARE"
