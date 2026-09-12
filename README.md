@@ -1,5 +1,7 @@
 # Xcode Console Bridge
 
+[中文说明](README.zh-CN.md)
+
 Turn the text currently visible in Xcode's Debug Console into a local evidence bundle that an AI coding agent can inspect safely.
 
 Xcode is excellent at showing runtime output, but it does not offer a documented public API for reading the populated Debug Console. That leaves a gap in a macOS iOS development loop: an agent can read source code and make a change, while the developer still has to manually export the runtime evidence after reproducing a problem.
